@@ -7,6 +7,7 @@
     - Owner of each first-level subdirectory
     - Full path to the directory
     - Total size of all files within and beneath that directory
+    - Age of the newest file within each directory
 
     The script parses XCP's output format and aggregates file sizes for each top-level folder.
 
@@ -18,6 +19,10 @@
 .PARAMETER NetLocation
     The SMB path to scan in UNC format (e.g., \\server\share or \\192.168.1.100\data).
     This parameter is mandatory.
+
+.PARAMETER Parallel
+    Number of parallel XCP processes to use for scanning. Default is 8.
+    Valid range: 1-61.
 
 .PARAMETER LogToFile
     Enable transcript logging to a file in the script's directory.
@@ -39,20 +44,20 @@
 
 .EXAMPLE
     .\Get-XCPFolderReport.ps1 -NetLocation "\\fileserver\projects"
-    Scans the projects share, generates a CSV report, and opens it in the default application.
+    Scans the projects share with 8 parallel processes (default), generates a CSV report, and opens it.
 
 .EXAMPLE
-    .\Get-XCPFolderReport.ps1 -NetLocation "\\192.168.1.50\home" -LogToFile
-    Scans with transcript logging enabled, opens both CSV and log file after completion.
+    .\Get-XCPFolderReport.ps1 -NetLocation "\\192.168.1.50\home" -Parallel 16 -LogToFile
+    Scans with 16 parallel processes and transcript logging enabled.
 
 .EXAMPLE
-    .\Get-XCPFolderReport.ps1 -NetLocation "\\fileserver\projects\users" -Debug -NoAutoOpen
-    Scans the users subfolder with debug output, does not auto-open files.
+    .\Get-XCPFolderReport.ps1 -NetLocation "\\fileserver\projects\users" -Parallel 4 -Debug -NoAutoOpen
+    Scans the users subfolder with 4 parallel processes, debug output, and no auto-open.
 
 .NOTES
     Author: Converted from Bash script
     Requires: NetApp XCP installed and configured for SMB scanning
-    Version: 2.0
+    Version: 2.1
 #>
 
 [CmdletBinding()]
@@ -60,6 +65,10 @@ param(
     [Parameter(Mandatory = $true, HelpMessage = "SMB path to scan (e.g., \\server\share)")]
     [Alias("Path", "Location")]
     [string]$NetLocation,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Number of parallel XCP processes (default: 8)")]
+    [ValidateRange(1, 61)]
+    [int]$Parallel = 8,
 
     [Parameter(Mandatory = $false, HelpMessage = "Enable transcript logging to file")]
     [switch]$LogToFile,
@@ -77,6 +86,7 @@ $LogFile = Join-Path $ScriptDir "XCPFolderReport_$Timestamp.log"
 
 # Start transcript if logging enabled
 if ($LogToFile) {
+    $DebugPreference = "Continue"  # Ensure debug output goes to transcript without prompting
     Start-Transcript -Path $LogFile
     Write-Host "Transcript logging enabled: $LogFile" -ForegroundColor Cyan
 }
@@ -92,9 +102,23 @@ Write-Debug "NetLocation (input) = $NetLocation"
 
 # Pre-compile regex patterns for performance on large scans
 # These are compiled to IL code once, avoiding per-line pattern parsing overhead
-$SplitRegex = [regex]::new('\s{2,}|\t', 'Compiled')
-$SizeParseRegex = [regex]::new('^([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)$', 'Compiled, IgnoreCase')
+$SizeParseRegex = [regex]::new('^([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)?$', 'Compiled, IgnoreCase')
 $PlainNumberRegex = [regex]::new('^\d+$', 'Compiled')
+
+# XCP line format: type owner size age path
+# Example: f S-1-22-1-1000  65.1KiB   59d4h pi-hole\etc-pihole\pihole.toml
+# Example: f S-1-22-1-1000      729   59d4h pi-hole\etc-pihole\tls_ca.crt (no unit = bytes)
+# Example: f S-1-22-1-992   40.2MiB    +0s  cluster\gitlab\... (+ prefix for very recent files)
+# Fields are separated by varying whitespace, so we match by known patterns:
+# - Type: single char (d or f)
+# - Owner: non-whitespace (SID, DOMAIN\user, or username)
+# - Size: number + optional unit (e.g., 65.1KiB, 1.5GiB, 729)
+# - Age: optional + prefix, then number + time unit (e.g., 59d4h, 7y0d, 1h30m, +0s)
+# - Path: everything remaining
+$XCPLineRegex = [regex]::new(
+    '^(?<type>[df])\s+(?<owner>\S+)\s+(?<size>[\d.]+[KMGTP]?i?B?)\s+(?<age>\+?\d+\w+)\s+(?<path>.+)$',
+    'Compiled, IgnoreCase'
+)
 
 Write-Debug "Pre-compiled regex patterns initialized"
 
@@ -155,39 +179,98 @@ function Convert-BytesToSize {
     }
 }
 
-# Function to extract the first-level directory from a full path
-# Given \\server\share\users\jsmith\docs, with base \\server\share\users,
-# returns \\server\share\users\jsmith
+# Function to convert XCP age string to total seconds for comparison
+# Examples: 59d4h, 7y0d, 1h30m, +0s, 5m20s
+function Convert-AgeToSeconds {
+    param([string]$AgeString)
+
+    # Remove leading + if present
+    $AgeString = $AgeString.TrimStart('+')
+
+    $totalSeconds = [long]0
+
+    # Match patterns like 7y, 59d, 4h, 30m, 20s
+    $yearMatch = [regex]::Match($AgeString, '(\d+)y')
+    $dayMatch = [regex]::Match($AgeString, '(\d+)d')
+    $hourMatch = [regex]::Match($AgeString, '(\d+)h')
+    $minMatch = [regex]::Match($AgeString, '(\d+)m')
+    $secMatch = [regex]::Match($AgeString, '(\d+)s')
+
+    if ($yearMatch.Success) {
+        $totalSeconds += [long]$yearMatch.Groups[1].Value * 365 * 24 * 60 * 60
+    }
+    if ($dayMatch.Success) {
+        $totalSeconds += [long]$dayMatch.Groups[1].Value * 24 * 60 * 60
+    }
+    if ($hourMatch.Success) {
+        $totalSeconds += [long]$hourMatch.Groups[1].Value * 60 * 60
+    }
+    if ($minMatch.Success) {
+        $totalSeconds += [long]$minMatch.Groups[1].Value * 60
+    }
+    if ($secMatch.Success) {
+        $totalSeconds += [long]$secMatch.Groups[1].Value
+    }
+
+    return $totalSeconds
+}
+
+# Function to convert seconds back to human-readable age format
+function Convert-SecondsToAge {
+    param([long]$Seconds)
+
+    if ($Seconds -ge (365 * 24 * 60 * 60)) {
+        $years = [math]::Floor($Seconds / (365 * 24 * 60 * 60))
+        $days = [math]::Floor(($Seconds % (365 * 24 * 60 * 60)) / (24 * 60 * 60))
+        return "{0}y{1}d" -f $years, $days
+    }
+    elseif ($Seconds -ge (24 * 60 * 60)) {
+        $days = [math]::Floor($Seconds / (24 * 60 * 60))
+        $hours = [math]::Floor(($Seconds % (24 * 60 * 60)) / (60 * 60))
+        return "{0}d{1}h" -f $days, $hours
+    }
+    elseif ($Seconds -ge (60 * 60)) {
+        $hours = [math]::Floor($Seconds / (60 * 60))
+        $mins = [math]::Floor(($Seconds % (60 * 60)) / 60)
+        return "{0}h{1}m" -f $hours, $mins
+    }
+    elseif ($Seconds -ge 60) {
+        $mins = [math]::Floor($Seconds / 60)
+        $secs = $Seconds % 60
+        return "{0}m{1}s" -f $mins, $secs
+    }
+    else {
+        return "{0}s" -f $Seconds
+    }
+}
+
+# Function to extract the first-level directory from a relative XCP path
+# XCP returns paths relative to scan location, e.g., "pi-hole\etc-pihole\file.txt"
+# where "pi-hole" is the scanned folder and "etc-pihole" is a first-level subdir
+# We want to return "pi-hole\etc-pihole" for aggregation
 function Get-FirstLevelDir {
     param(
-        [string]$FullPath,
-        [int]$TargetDepth
+        [string]$RelativePath
     )
 
-    # Count backslashes to find depth
-    $slashCount = 0
-    $cutoffIndex = -1
+    # Find the first and second backslash positions
+    $firstSlash = $RelativePath.IndexOf('\')
 
-    for ($i = 0; $i -lt $FullPath.Length; $i++) {
-        if ($FullPath[$i] -eq '\') {
-            $slashCount++
-            if ($slashCount -eq $TargetDepth) {
-                $cutoffIndex = $i
-            }
-            elseif ($slashCount -gt $TargetDepth) {
-                # Path is deeper than first level, truncate to first-level dir
-                return $FullPath.Substring(0, $cutoffIndex)
-            }
-        }
+    # If no backslash, this is a file/dir in the root of the scanned folder
+    # We don't aggregate these (or it's the root folder itself)
+    if ($firstSlash -eq -1) {
+        return $null
     }
 
-    # If we reach here with exact target depth, return the full path (it IS a first-level dir)
-    if ($slashCount -eq $TargetDepth) {
-        return $FullPath
+    $secondSlash = $RelativePath.IndexOf('\', $firstSlash + 1)
+
+    # If no second backslash, this path IS a first-level item (e.g., "pi-hole\etc-pihole")
+    if ($secondSlash -eq -1) {
+        return $RelativePath
     }
 
-    # Path is shallower than target depth (shouldn't happen for valid items)
-    return $null
+    # Otherwise, extract up to the second backslash (e.g., "pi-hole\etc-pihole" from "pi-hole\etc-pihole\file.txt")
+    return $RelativePath.Substring(0, $secondSlash)
 }
 
 #endregion
@@ -223,14 +306,6 @@ Write-Debug "Server = $Server"
 Write-Debug "ShareName = $ShareName"
 Write-Debug "BaseSharePath = $BaseSharePath"
 Write-Debug "SubPath = $SubPath"
-
-# Calculate base depth by counting backslashes in the scan path
-# \\server\share = 3 backslashes, so first-level dirs have 4 backslashes
-$BaseDepth = ($NetLocation.ToCharArray() | Where-Object { $_ -eq '\' }).Count
-$TargetDepth = $BaseDepth + 1
-
-Write-Debug "BaseDepth = $BaseDepth"
-Write-Debug "TargetDepth = $TargetDepth"
 
 #endregion
 
@@ -285,9 +360,9 @@ Write-Host "Scanning $NetLocation with XCP (this may take a moment)..." -Foregro
 Write-Debug "Starting XCP scan with stream processing..."
 
 # Build XCP command
-# XCP SMB scan format: xcp scan -l -ownership \\server\share
+# XCP SMB scan format: xcp scan -l -ownership -parallel # \\server\share
 # Output format: type  owner  size  age  path
-$XCPArgs = @("scan", "-l", "-ownership", $NetLocation)
+$XCPArgs = @("scan", "-l", "-ownership", "-parallel", $Parallel, $NetLocation)
 Write-Debug "XCPArgs = $($XCPArgs -join ' ')"
 
 # Initialize hashtable for aggregating folder stats
@@ -317,44 +392,52 @@ try {
             return
         }
 
-        # Split line using pre-compiled regex
-        # Format: Type  Owner  Size  Age  Path
-        $Parts = $SplitRegex.Split($Line) | Where-Object { $_ -ne '' }
+        # Parse line using regex that matches XCP output format
+        # Format: type owner size age path
+        $Match = $XCPLineRegex.Match($Line)
 
-        # Valid data lines start with 'd' (directory) or 'f' (file)
-        # Skip any line that doesn't match this pattern (headers, summaries, etc.)
-        if ($Parts.Count -lt 5 -or $Parts[0] -notmatch '^[df]$') {
+        if (-not $Match.Success) {
             Write-Debug "Skipping line $LineCount (not a data line): $Line"
             return
         }
 
-        $ItemType = $Parts[0]
-        $Owner = $Parts[1]
-        $SizeStr = $Parts[2]
-        # $Age = $Parts[3]  # Not used in current report
-        # Path may contain spaces, so join remaining parts
-        $ItemPath = ($Parts[4..($Parts.Count-1)] -join ' ')
+        $ItemType = $Match.Groups['type'].Value
+        $Owner = $Match.Groups['owner'].Value
+        $SizeStr = $Match.Groups['size'].Value
+        $AgeStr = $Match.Groups['age'].Value
+        $ItemPath = $Match.Groups['path'].Value
 
         # Determine which first-level directory this item belongs to
-        $FirstLevelDir = Get-FirstLevelDir -FullPath $ItemPath -TargetDepth $TargetDepth
+        $FirstLevelDir = Get-FirstLevelDir -RelativePath $ItemPath
 
         if ($FirstLevelDir) {
             # Convert size to bytes
             $SizeBytes = Convert-SizeToBytes -SizeString $SizeStr
 
+            # Convert age to seconds for comparison (smaller = newer)
+            $AgeSeconds = Convert-AgeToSeconds -AgeString $AgeStr
+
             # Aggregate into hashtable
             if ($FolderStats.ContainsKey($FirstLevelDir)) {
                 # Add to existing total
                 $FolderStats[$FirstLevelDir].TotalBytes += $SizeBytes
+
+                # Track newest file (smallest age)
+                if ($AgeSeconds -lt $FolderStats[$FirstLevelDir].NewestAgeSeconds) {
+                    $FolderStats[$FirstLevelDir].NewestAgeSeconds = $AgeSeconds
+                    $FolderStats[$FirstLevelDir].NewestAgeStr = $AgeStr
+                }
             }
             else {
                 # First time seeing this directory - initialize entry
                 # For owner, use the owner of the directory itself (type 'd' with exact path match)
                 # or the first file's owner as fallback
                 $FolderStats[$FirstLevelDir] = [PSCustomObject]@{
-                    Owner      = $Owner
-                    TotalBytes = $SizeBytes
-                    IsDir      = ($ItemType -eq 'd' -and $ItemPath -eq $FirstLevelDir)
+                    Owner            = $Owner
+                    TotalBytes       = $SizeBytes
+                    IsDir            = ($ItemType -eq 'd' -and $ItemPath -eq $FirstLevelDir)
+                    NewestAgeSeconds = $AgeSeconds
+                    NewestAgeStr     = $AgeStr
                 }
                 Write-Debug "New first-level dir: $FirstLevelDir (Owner: $Owner)"
             }
@@ -406,15 +489,33 @@ Write-Host "Processing complete. Found $($FolderStats.Count) first-level directo
 
 Write-Debug "Building results from aggregated data..."
 
+# Get the parent of the scanned path for building full UNC paths
+# XCP paths start with the last component of NetLocation, so we need the parent
+# Handle edge case where NetLocation is the root of a share (no parent)
+$NetLocationParent = Split-Path -Parent $NetLocation
+if ([string]::IsNullOrEmpty($NetLocationParent)) {
+    # NetLocation is at share root, so the XCP relative paths ARE the full paths under the share
+    # Just prepend the NetLocation itself
+    $NetLocationParent = $NetLocation
+}
+
+Write-Debug "NetLocationParent = $NetLocationParent"
+
 # Convert hashtable to sorted results array
 $Results = $FolderStats.GetEnumerator() | Sort-Object -Property Name | ForEach-Object {
     $TotalSize = Convert-BytesToSize -Bytes $_.Value.TotalBytes
 
+    # Build full UNC path: parent + relative first-level dir
+    # e.g., "\\server\share" + "pi-hole\etc-pihole" = "\\server\share\pi-hole\etc-pihole"
+    $FullPath = Join-Path $NetLocationParent $_.Name
+
     [PSCustomObject]@{
-        Owner     = $_.Value.Owner
-        Path      = $_.Name
-        SizeBytes = $_.Value.TotalBytes
-        TotalSize = $TotalSize
+        Owner           = $_.Value.Owner
+        Path            = $FullPath
+        TotalSize       = $TotalSize
+        NewestFileAge   = $_.Value.NewestAgeStr
+        SizeBytes       = $_.Value.TotalBytes
+        NewestAgeSeconds = $_.Value.NewestAgeSeconds
     }
 }
 
@@ -436,7 +537,7 @@ $CSVPath = Join-Path (Get-Location) $CSVFileName
 Write-Debug "CSVPath = $CSVPath"
 
 # Export to CSV (select only the columns we want, in order)
-$Results | Select-Object Owner, Path, TotalSize | Export-Csv -Path $CSVPath -NoTypeInformation -Encoding UTF8
+$Results | Select-Object Owner, Path, TotalSize, NewestFileAge | Export-Csv -Path $CSVPath -NoTypeInformation -Encoding UTF8
 
 Write-Host ""
 Write-Host ("=" * 80) -ForegroundColor Green
@@ -446,7 +547,7 @@ Write-Host ""
 
 # Display to console as formatted table
 if ($Results.Count -gt 0) {
-    $Results | Select-Object Owner, Path, TotalSize | Format-Table -AutoSize
+    $Results | Select-Object Owner, Path, TotalSize, NewestFileAge | Format-Table -AutoSize
 }
 else {
     Write-Host "No first-level subdirectories found." -ForegroundColor Yellow

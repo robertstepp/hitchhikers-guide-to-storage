@@ -92,7 +92,6 @@ Write-Debug "NetLocation (input) = $NetLocation"
 
 # Pre-compile regex patterns for performance on large scans
 # These are compiled to IL code once, avoiding per-line pattern parsing overhead
-$SkipLineRegex = [regex]::new('^\s*(scanned|XCP|---|\d+\s+scanned)', 'Compiled, IgnoreCase')
 $SplitRegex = [regex]::new('\s{2,}|\t', 'Compiled')
 $SizeParseRegex = [regex]::new('^([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)$', 'Compiled, IgnoreCase')
 $PlainNumberRegex = [regex]::new('^\d+$', 'Compiled')
@@ -312,12 +311,6 @@ try {
         # Skip empty lines
         if ([string]::IsNullOrWhiteSpace($Line)) { return }
 
-        # Skip summary/header lines using pre-compiled regex
-        if ($SkipLineRegex.IsMatch($Line)) {
-            Write-Debug "Skipping line $LineCount (header/summary)"
-            return
-        }
-
         # Check for error output (ErrorRecord objects from 2>&1)
         if ($Line -is [System.Management.Automation.ErrorRecord]) {
             $ErrorLines += $Line.ToString()
@@ -328,46 +321,51 @@ try {
         # Format: Type  Owner  Size  Age  Path
         $Parts = $SplitRegex.Split($Line) | Where-Object { $_ -ne '' }
 
-        if ($Parts.Count -ge 5) {
-            $ItemType = $Parts[0]
-            $Owner = $Parts[1]
-            $SizeStr = $Parts[2]
-            # $Age = $Parts[3]  # Not used in current report
-            # Path may contain spaces, so join remaining parts
-            $ItemPath = ($Parts[4..($Parts.Count-1)] -join ' ')
+        # Valid data lines start with 'd' (directory) or 'f' (file)
+        # Skip any line that doesn't match this pattern (headers, summaries, etc.)
+        if ($Parts.Count -lt 5 -or $Parts[0] -notmatch '^[df]$') {
+            Write-Debug "Skipping line $LineCount (not a data line): $Line"
+            return
+        }
 
-            # Determine which first-level directory this item belongs to
-            $FirstLevelDir = Get-FirstLevelDir -FullPath $ItemPath -TargetDepth $TargetDepth
+        $ItemType = $Parts[0]
+        $Owner = $Parts[1]
+        $SizeStr = $Parts[2]
+        # $Age = $Parts[3]  # Not used in current report
+        # Path may contain spaces, so join remaining parts
+        $ItemPath = ($Parts[4..($Parts.Count-1)] -join ' ')
 
-            if ($FirstLevelDir) {
-                # Convert size to bytes
-                $SizeBytes = Convert-SizeToBytes -SizeString $SizeStr
+        # Determine which first-level directory this item belongs to
+        $FirstLevelDir = Get-FirstLevelDir -FullPath $ItemPath -TargetDepth $TargetDepth
 
-                # Aggregate into hashtable
-                if ($FolderStats.ContainsKey($FirstLevelDir)) {
-                    # Add to existing total
-                    $FolderStats[$FirstLevelDir].TotalBytes += $SizeBytes
-                }
-                else {
-                    # First time seeing this directory - initialize entry
-                    # For owner, use the owner of the directory itself (type 'd' with exact path match)
-                    # or the first file's owner as fallback
-                    $FolderStats[$FirstLevelDir] = [PSCustomObject]@{
-                        Owner      = $Owner
-                        TotalBytes = $SizeBytes
-                        IsDir      = ($ItemType -eq 'd' -and $ItemPath -eq $FirstLevelDir)
-                    }
-                    Write-Debug "New first-level dir: $FirstLevelDir (Owner: $Owner)"
-                }
+        if ($FirstLevelDir) {
+            # Convert size to bytes
+            $SizeBytes = Convert-SizeToBytes -SizeString $SizeStr
 
-                # If this IS the directory entry itself, update owner to be accurate
-                if ($ItemType -eq 'd' -and $ItemPath -eq $FirstLevelDir) {
-                    $FolderStats[$FirstLevelDir].Owner = $Owner
-                    $FolderStats[$FirstLevelDir].IsDir = $true
-                }
-
-                $ProcessedCount++
+            # Aggregate into hashtable
+            if ($FolderStats.ContainsKey($FirstLevelDir)) {
+                # Add to existing total
+                $FolderStats[$FirstLevelDir].TotalBytes += $SizeBytes
             }
+            else {
+                # First time seeing this directory - initialize entry
+                # For owner, use the owner of the directory itself (type 'd' with exact path match)
+                # or the first file's owner as fallback
+                $FolderStats[$FirstLevelDir] = [PSCustomObject]@{
+                    Owner      = $Owner
+                    TotalBytes = $SizeBytes
+                    IsDir      = ($ItemType -eq 'd' -and $ItemPath -eq $FirstLevelDir)
+                }
+                Write-Debug "New first-level dir: $FirstLevelDir (Owner: $Owner)"
+            }
+
+            # If this IS the directory entry itself, update owner to be accurate
+            if ($ItemType -eq 'd' -and $ItemPath -eq $FirstLevelDir) {
+                $FolderStats[$FirstLevelDir].Owner = $Owner
+                $FolderStats[$FirstLevelDir].IsDir = $true
+            }
+
+            $ProcessedCount++
         }
 
         # Progress indicator every 10000 lines
